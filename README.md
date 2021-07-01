@@ -63,7 +63,7 @@ cd /usr/share/
 git clone --recursive https://github.com/pytorch/pytorch
 cd pytorch/
 git clone --recursive https://github.com/pytorch/xla.git
-git clone --recursive https://github.com/mlexample/gcspytorchimagenet.git
+git clone --recursive https://github.com/mlexample/torchxla_tpu.git
 EOF'
 ```
 Once the TPU VM is created, either SSH through the Cloud Console (Compute Engine > VM Instances > t1v-n-XXXXX-w-0 > SSH) or run the following command:
@@ -78,7 +78,7 @@ gcloud compute config-ssh
 
 ## PyTorch Training
 
-Check to make sure the metadata startup script has cloned all the repositories. After running the following command, we should see `gcspytorchimagenet`
+Check to make sure the metadata startup script has cloned all the repositories. After running the following command, we should see `torchxla_tpu`
 ```
 cd /usr/share/pytorch
 ```
@@ -118,7 +118,7 @@ export LOAD_CHKPT_DIR=                  # local directory/filename
 ```
 python3 -m torch_xla.distributed.xla_dist --tpu=$TPU_NAME \
    --restart-tpuvm-pod-server --env XLA_USE_BF16=1 \
-   -- python3 /usr/share/pytorch/REPO/test_train_mp_wds_cifar.py \
+   -- python3 /usr/share/pytorch/torchxla_tpu/test_train_mp_wds_cifar.py \
    --num_epochs=$NUM_EPOCHS \
    --batch_size=$BATCH_SIZE \
    --num_workers=$NUM_WORKERS \
