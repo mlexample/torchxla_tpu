@@ -19,6 +19,9 @@ import datetime
 import time
 from itertools import islice
 import torch_xla.debug.profiler as xp
+from google.cloud import storage
+from google.cloud.storage.bucket import Bucket
+from google.cloud.storage.blob import Blob
 
 for extra in ('/usr/share/torch-xla-1.8/pytorch/xla/test', '/pytorch/xla/test', '/usr/share/pytorch/xla/test'):
     if os.path.exists(extra):
@@ -34,6 +37,8 @@ SUPPORTED_MODELS = [
     'resnet50', 'squeezenet1_0', 'squeezenet1_1', 'vgg11', 'vgg11_bn', 'vgg13',
     'vgg13_bn', 'vgg16', 'vgg16_bn', 'vgg19', 'vgg19_bn'
 ]
+
+
 MODEL_OPTS = {
     '--model': {
         'choices': SUPPORTED_MODELS,
@@ -58,11 +63,11 @@ MODEL_OPTS = {
     },
     '--wds_traindir': {
         'type': str,
-        'default':'/tmp/imagenet',
+        'default':'/tmp/cifar',
     },
     '--wds_testdir': {
         'type': str,
-        'default': '/tmp/imagenet',
+        'default': '/tmp/cifar',
     },
     '--trainsize': {
         'type': int,
@@ -72,8 +77,23 @@ MODEL_OPTS = {
         'type': int,
         'default': 50000,
     },
+    '--save_model': {
+        'type': str,
+        'default': "",
+    },
+    '--load_chkpt_file': {
+        'type': str,
+        'default': "",
+    },
+    '--load_chkpt_dir': {
+        'type': str,
+        'default': "",
+    },
+    '--model_bucket': {
+        'type': str,
+        'default': "",
+    },
 }
-
 FLAGS = args_parse.parse_common_options(
     datadir='/tmp/imagenet',
     batch_size=None,
@@ -84,6 +104,8 @@ FLAGS = args_parse.parse_common_options(
     opts=MODEL_OPTS.items(),
     profiler_port=9012,
 )
+
+
 
 DEFAULT_KWARGS = dict(
     batch_size=128,
@@ -141,6 +163,22 @@ def _train_update(device, step, loss, tracker, epoch, writer):
 trainsize = FLAGS.trainsize # 1280000
 testsize = FLAGS.testsize # 50000 
 
+def _upload_blob_gcs(gcs_uri, source_file_name, destination_blob_name):
+    """Uploads a file to GCS bucket"""
+    client = storage.Client()
+    blob = Blob.from_string(os.path.join(gcs_uri, destination_blob_name))
+    blob.bucket._client = client
+    blob.upload_from_filename(source_file_name)
+    
+    xm.master_print("Saved Model Checkpoint file {} and uploaded to {}.".format(source_file_name, os.path.join(gcs_uri, destination_blob_name)))
+    
+def _read_blob_gcs(BUCKET, CHKPT_FILE, DESTINATION):
+    """Downloads a file from GCS to local directory"""
+    client = storage.Client()
+    bucket = client.get_bucket(BUCKET)
+    blob = bucket.get_blob(CHKPT_FILE)
+    blob.download_to_filename(DESTINATION)
+    
 def identity(x):
     return x   
 
@@ -178,8 +216,9 @@ def my_node_splitter(urls):
 
 normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 
-def make_train_loader(img_dim, shuffle=10000, batch_size=FLAGS.batch_size):
 
+
+def make_train_loader(img_dim, shuffle=10000, batch_size=FLAGS.batch_size):
     num_dataset_instances = xm.xrt_world_size() * FLAGS.num_workers
     epoch_size = trainsize // num_dataset_instances
 
@@ -194,7 +233,9 @@ def make_train_loader(img_dim, shuffle=10000, batch_size=FLAGS.batch_size):
     
     dataset = (
         wds.WebDataset(FLAGS.wds_traindir, 
-        splitter=my_worker_splitter, nodesplitter=my_node_splitter, shardshuffle=True, length=epoch_size)
+                       splitter=my_worker_splitter, 
+                       nodesplitter=my_node_splitter, 
+                       shardshuffle=True, length=epoch_size)
         .shuffle(shuffle)
         .decode("pil")
         .to_tuple("ppm;jpg;jpeg;png", "cls")
@@ -206,7 +247,6 @@ def make_train_loader(img_dim, shuffle=10000, batch_size=FLAGS.batch_size):
     return loader
   
 def make_val_loader(img_dim, resize_dim, batch_size=FLAGS.test_set_batch_size):
-    
     num_dataset_instances = xm.xrt_world_size() * FLAGS.num_workers
     epoch_test_size = testsize // num_dataset_instances
 
@@ -221,7 +261,9 @@ def make_val_loader(img_dim, resize_dim, batch_size=FLAGS.test_set_batch_size):
 
     val_dataset = (
         wds.WebDataset(FLAGS.wds_testdir, # FLAGS.wds_testdir, 
-        splitter=my_worker_splitter, nodesplitter=my_node_splitter, shardshuffle=False, length=epoch_test_size) 
+                       splitter=my_worker_splitter, 
+                       nodesplitter=my_node_splitter, 
+                       shardshuffle=False, length=epoch_test_size) 
         .decode("pil")
         .to_tuple("ppm;jpg;jpeg;png", "cls")
         .map_tuple(val_transform, identity)
@@ -263,14 +305,18 @@ def train_imagenet():
         num_steps_per_epoch=num_training_steps_per_epoch,
         summary_writer=writer)
     loss_fn = nn.CrossEntropyLoss()
-    
+    if FLAGS.load_chkpt_file != "":
+        xm.master_print("Loading saved model {}".format(FLAGS.load_chkpt_file))
+        _read_blob_gcs(FLAGS.model_bucket, FLAGS.load_chkpt_file, FLAGS.load_chkpt_dir)
+        checkpoint = torch.load(FLAGS.load_chkpt_dir) # torch.load(FLAGS.load_chkpt_dir)
+        model.load_state_dict(checkpoint['model_state_dict']) #.to(device)
+        model = model.to(device)
 #     server = xp.start_server(profiler_port)
 
     def train_loop_fn(loader, epoch):
         train_steps = trainsize // (FLAGS.batch_size * xm.xrt_world_size())
         tracker = xm.RateTracker()
         total_samples = 0
-        rate_list = []
         model.train()
         for step, (data, target) in enumerate(loader):
             optimizer.zero_grad()
@@ -316,24 +362,53 @@ def train_imagenet():
     test_device_loader = pl.MpDeviceLoader(test_loader, device)
     accuracy, max_accuracy = 0.0, 0.0
     training_start_time = time.time()
+    
+    if FLAGS.load_chkpt_file != "":
+        best_valid_acc = checkpoint['best_valid_acc']
+        start_epoch = checkpoint['epoch']
+        xm.master_print('Loaded Model CheckPoint: Epoch={}/{}, Val Accuracy={:.2f}%'.format(
+            start_epoch, FLAGS.num_epochs, best_valid_acc))
+    else:
+        best_valid_acc = 0.0
+        start_epoch = 1
+    
     for epoch in range(1, FLAGS.num_epochs + 1):
         xm.master_print('Epoch {} train begin {}'.format(
             epoch, test_utils.now()))
         replica_epoch_start = time.time()
         
         replica_train_samples, reduced_global = train_loop_fn(train_device_loader, epoch)
-        
         replica_epoch_time = time.time() - replica_epoch_start
         avg_epoch_time_mesh = xm.mesh_reduce('epoch_time', replica_epoch_time, np.mean)
         reduced_global = reduced_global * xm.xrt_world_size()
-        
         xm.master_print('Epoch {} train end {}, Epoch Time={}, Replica Train Samples={}, Reduced GlobalRate={:.2f}'.format(
-            epoch, test_utils.now(), str(datetime.timedelta(seconds=avg_epoch_time_mesh)).split('.')[0], replica_train_samples, reduced_global))
+            epoch, test_utils.now(), 
+            str(datetime.timedelta(seconds=avg_epoch_time_mesh)).split('.')[0], 
+            replica_train_samples, 
+            reduced_global))
         
         accuracy, accuracy_replica, replica_test_samples = test_loop_fn(test_device_loader, epoch)
-
         xm.master_print('Epoch {} test end {}, Reduced Accuracy={:.2f}%, Replica Accuracy={:.2f}%, Replica Test Samples={}'.format(
-            epoch, test_utils.now(), accuracy, accuracy_replica, replica_test_samples))
+            epoch, test_utils.now(), 
+            accuracy, accuracy_replica, 
+            replica_test_samples))
+        
+        if FLAGS.save_model != "":
+            if accuracy > best_valid_acc:
+                xm.master_print('Epoch {} validation accuracy improved from {:.2f}% to {:.2f}% - saving model...'.format(epoch, best_valid_acc, accuracy))
+                best_valid_acc = accuracy
+                xm.save(
+                    {
+                        "epoch": epoch,
+                        "nepochs": FLAGS.num_epochs,
+                        "model_state_dict": model.state_dict(),
+                        "best_valid_acc": best_valid_acc,
+                        "opt_state_dict": optimizer.state_dict(),
+                    },
+                    FLAGS.save_model,
+                )
+                if xm.is_master_ordinal():
+                    _upload_blob_gcs(FLAGS.logdir, FLAGS.save_model, 'model-chkpt.pt')
         
         max_accuracy = max(accuracy, max_accuracy)
         test_utils.write_to_summary(
