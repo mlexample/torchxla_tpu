@@ -47,7 +47,7 @@ Set the following environment variables
 ```
 export REGION=europe-west4
 export ZONE=europe-west4-a
-export ACCELERATOR_TYPE=v3-32
+export ACCELERATOR_TYPE=v3-32 # or v2-32
 export TPU_NAME=my-1vm-tpu
 export RUNTIME_VERSION=v2-alpha
 ```
