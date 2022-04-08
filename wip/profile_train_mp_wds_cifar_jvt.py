@@ -190,7 +190,8 @@ normalize = transforms.Normalize(mean=[0.4914, 0.4822, 0.4465], std=[0.2023, 0.1
 
 cifar_img_dim = 32
 
-def make_train_loader(cifar_img_dim, shuffle=10000, batch_size=FLAGS.batch_size):
+def make_train_loader(cifar_img_dim, shuffle=10000,batch_size=FLAGS.batch_size):
+    
   num_dataset_instances = xm.xrt_world_size() * FLAGS.num_workers
   epoch_size = trainsize // num_dataset_instances
   
@@ -207,26 +208,208 @@ def make_train_loader(cifar_img_dim, shuffle=10000, batch_size=FLAGS.batch_size)
     wds.ResampledShards(FLAGS.wds_traindir),
     # we now have an iterator over all shards
     wds.tarfile_to_samples(),
-    wds.shuffle(1000),
+#     wds.shuffle(1000), # TODO
     wds.decode("pil"),
     # we now have a list of decompressed train samples from each shard in this worker, in sequence
-    wds.shuffle(10000),
+    wds.shuffle(shuffle), # TODO
     wds.to_tuple("ppm;jpg;jpeg;png", "cls"),
     wds.map_tuple(image_transform, identity),
     wds.batched(batch_size)
-  ).with_epoch(num_dataset_instances)
+  ).with_epoch(epoch_size)
   
   loader = wds.WebLoader(dataset, num_workers=FLAGS.num_workers, batch_size=None)
   
   return loader
 
 # TODO
+def make_val_loader(cifar_img_dim, batch_size=FLAGS.test_set_batch_size):
     
+    num_dataset_instances = xm.xrt_world_size() * FLAGS.num_workers
+    epoch_test_size = testsize // num_dataset_instances
+    
+    val_transform = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            normalize,
+        ]
+    )
+    
+    val_dataset = wds.DataPipeline(
+        wds.ResampledShards(FLAGS.wds_testdir),
+        wds.tarfile_to_samples(),
+        wds.decode("pil"),
+        wds.to_tuple("ppm;jpg;jpeg;png", "cls"),
+        wds.map_tuple(val_transform, identity),
+        wds.batched(batch_size),
+    ).with_epoch(epoch_test_size)
+    
+    val_loader = wds.WebLoader(val_dataset, num_workers=FLAGS.num_workers, batch_size=None)
+    return val_loader
 
+def train_imagenet():
+    print('==> Preparing data..')
+    train_loader = make_train_loader(cifar_img_dim, batch_size=FLAGS.batch_size, shuffle=10000)
+    test_loader = make_val_loader(cifar_img_dim, batch_size=FLAGS.test_set_batch_size)
   
+    torch.manual_seed(42)
+    server = xp.start_server(FLAGS.profiler_port)
+
+    device = xm.xla_device()
+    model = get_model_property('model_fn')().to(device)
+    writer = None
+    if xm.is_master_ordinal():
+        writer = test_utils.get_summary_writer(FLAGS.logdir)
+    optimizer = optim.SGD(
+        model.parameters(),
+        lr=FLAGS.lr,
+        momentum=FLAGS.momentum,
+        weight_decay=1e-4)
+    num_training_steps_per_epoch = trainsize // (
+        FLAGS.batch_size * xm.xrt_world_size())
+    lr_scheduler = schedulers.wrap_optimizer_with_scheduler(
+        optimizer,
+        scheduler_type=getattr(FLAGS, 'lr_scheduler_type', None),
+        scheduler_divisor=getattr(FLAGS, 'lr_scheduler_divisor', None),
+        scheduler_divide_every_n_epochs=getattr(
+            FLAGS, 'lr_scheduler_divide_every_n_epochs', None),
+        num_steps_per_epoch=num_training_steps_per_epoch,
+        summary_writer=writer)
+    loss_fn = nn.CrossEntropyLoss()
+    if FLAGS.load_chkpt_file != "":
+        xm.master_print("Loading saved model {}".format(FLAGS.load_chkpt_file))
+        _read_blob_gcs(FLAGS.model_bucket, FLAGS.load_chkpt_file, FLAGS.load_chkpt_dir)
+        checkpoint = torch.load(FLAGS.load_chkpt_dir) # torch.load(FLAGS.load_chkpt_dir)
+        model.load_state_dict(checkpoint['model_state_dict']) #.to(device)
+        model = model.to(device)
+        
+        
+    def train_loop_fn(loader, epoch):
+        train_steps = trainsize // (FLAGS.batch_size * xm.xrt_world_size())
+        tracker = xm.RateTracker()
+        total_samples = 0
+        model.train()
+        for step, (data, target) in enumerate(loader): 
+          with xp.StepTrace('train_step', step_num=step):
+            with xp.Trace('build_graph'):
+              optimizer.zero_grad()
+              output = model(data)
+              loss = loss_fn(output, target)
+              loss.backward()
+              xm.optimizer_step(optimizer)
+              tracker.add(FLAGS.batch_size)
+              total_samples += data.size()[0]
+              if lr_scheduler:
+                lr_scheduler.step()
+              if step % FLAGS.log_steps == 0:
+                xm.add_step_closure(
+                  _train_update, args=(device, step, loss, tracker, epoch, writer))
+                test_utils.write_to_summary(writer, step, dict_to_write={'Rate_step': tracker.rate()}, write_xla_metrics=False)
+              if step == train_steps:
+                break
+                
+        reduced_global = xm.mesh_reduce('reduced_global', tracker.global_rate(), np.mean)
+        return total_samples, reduced_global  
   
+    def test_loop_fn(loader, epoch):
+        test_steps = testsize // (FLAGS.test_set_batch_size * xm.xrt_world_size())
+        total_samples, correct = 0, 0
+        model.eval()
+        for step, (data, target) in enumerate(loader):
+            output = model(data)
+            pred = output.max(1, keepdim=True)[1]
+            correct += pred.eq(target.view_as(pred)).sum()
+            total_samples += data.size()[0]
+            if step % FLAGS.log_steps == 0:
+                xm.add_step_closure(
+                    test_utils.print_test_update, args=(device, None, epoch, step))
+            if step == test_steps:
+                break
+        correct_val = correct.item()
+        accuracy_replica = 100.0 * correct_val / total_samples
+        accuracy = xm.mesh_reduce('test_accuracy', accuracy_replica, np.mean)
+        return accuracy, accuracy_replica, total_samples
   
-  
-  
-  
+    # setup epoch loop
+    train_device_loader = pl.MpDeviceLoader(train_loader, device)
+    test_device_loader = pl.MpDeviceLoader(test_loader, device)
+    accuracy, max_accuracy = 0.0, 0.0
+    training_start_time = time.time()
+    
+    if FLAGS.load_chkpt_file != "":
+        best_valid_acc = checkpoint['best_valid_acc']
+        start_epoch = checkpoint['epoch']
+        xm.master_print('Loaded Model CheckPoint: Epoch={}/{}, Val Accuracy={:.2f}%'.format(
+            start_epoch, FLAGS.num_epochs, best_valid_acc))
+    else:
+        best_valid_acc = 0.0
+        start_epoch = 1
+    
+    for epoch in range(start_epoch, FLAGS.num_epochs + 1):
+        xm.master_print('Epoch {} train begin {}'.format(
+            epoch, test_utils.now()))
+        replica_epoch_start = time.time()
+        
+        replica_train_samples, reduced_global = train_loop_fn(train_device_loader, epoch)
+        replica_epoch_time = time.time() - replica_epoch_start
+        avg_epoch_time_mesh = xm.mesh_reduce('epoch_time', replica_epoch_time, np.mean)
+        reduced_global = reduced_global * xm.xrt_world_size()
+        xm.master_print('Epoch {} train end {}, Epoch Time={}, Replica Train Samples={}, Reduced GlobalRate={:.2f}'.format(
+            epoch, test_utils.now(), 
+            str(datetime.timedelta(seconds=avg_epoch_time_mesh)).split('.')[0], 
+            replica_train_samples, 
+            reduced_global))
+
+        accuracy, accuracy_replica, replica_test_samples = test_loop_fn(test_device_loader, epoch)
+        xm.master_print('Epoch {} test end {}, Reduced Accuracy={:.2f}%, Replica Accuracy={:.2f}%, Replica Test Samples={}'.format(
+            epoch, test_utils.now(), 
+            accuracy, accuracy_replica, 
+            replica_test_samples))
+        
+        if FLAGS.save_model != "":
+            if accuracy > best_valid_acc:
+                xm.master_print('Epoch {} validation accuracy improved from {:.2f}% to {:.2f}% - saving model...'.format(epoch, best_valid_acc, accuracy))
+                best_valid_acc = accuracy
+                xm.save(
+                    {
+                        "epoch": epoch,
+                        "nepochs": FLAGS.num_epochs,
+                        "model_state_dict": model.state_dict(),
+                        "best_valid_acc": best_valid_acc,
+                        "opt_state_dict": optimizer.state_dict(),
+                    },
+                    FLAGS.save_model,
+                )
+                if xm.is_master_ordinal():
+                    _upload_blob_gcs(FLAGS.logdir, FLAGS.save_model, 'model-chkpt.pt')
+                            
+        max_accuracy = max(accuracy, max_accuracy)
+        test_utils.write_to_summary(
+            writer,
+            epoch,
+            dict_to_write={'Accuracy/test': accuracy,
+                           'Global Rate': reduced_global},
+            write_xla_metrics=False)
+        if FLAGS.metrics_debug:
+            xm.master_print(met.metrics_report())
+    test_utils.close_summary_writer(writer)
+    total_train_time = time.time() - training_start_time
+    xm.master_print('Total Train Time: {}'.format(str(datetime.timedelta(seconds=total_train_time)).split('.')[0]))    
+    xm.master_print('Max Accuracy: {:.2f}%'.format(max_accuracy))
+    xm.master_print('Avg. Global Rate: {:.2f} examples per second'.format(reduced_global))
+    return max_accuracy
+
+
+def _mp_fn(index, flags):
+    global FLAGS
+    FLAGS = flags
+    torch.set_default_tensor_type('torch.FloatTensor')
+    accuracy = train_imagenet()
+    if accuracy < FLAGS.target_accuracy:
+        print('Accuracy {} is below target {}'.format(accuracy,
+                                                      FLAGS.target_accuracy))
+        sys.exit(21)
+
+
+if __name__ == '__main__':
+    xmp.spawn(_mp_fn, args=(FLAGS,), nprocs=FLAGS.num_cores, start_method='fork') # , start_method='spawn'  
   
