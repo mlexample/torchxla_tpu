@@ -215,9 +215,10 @@ def make_train_loader(cifar_img_dim, shuffle=10000,batch_size=FLAGS.batch_size):
     wds.to_tuple("ppm;jpg;jpeg;png", "cls"),
     wds.map_tuple(image_transform, identity),
     wds.batched(batch_size)
-  ).with_epoch(epoch_size).with_length(epoch_size)
+  ).with_epoch(epoch_size).with_length(epoch_size) # adds `__len__` method to dataset
   
   loader = wds.WebLoader(dataset, num_workers=FLAGS.num_workers, batch_size=None)
+  loader = loader.with_length(epoch_size) # adds `__len__` method to dataloader
   
   return loader
 
@@ -241,9 +242,11 @@ def make_val_loader(cifar_img_dim, batch_size=FLAGS.test_set_batch_size):
         wds.to_tuple("ppm;jpg;jpeg;png", "cls"),
         wds.map_tuple(val_transform, identity),
         wds.batched(batch_size),
-    ).with_epoch(epoch_test_size).with_length(epoch_test_size)
+    ).with_epoch(epoch_test_size).with_length(epoch_test_size) # adds `__len__` method to dataset
     
     val_loader = wds.WebLoader(val_dataset, num_workers=FLAGS.num_workers, batch_size=None)
+    val_loader = val_loader.with_length(epoch_test_size) # adds `__len__` method to dataloader
+    
     return val_loader
 
 def train_imagenet():
