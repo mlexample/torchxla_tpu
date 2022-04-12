@@ -1,6 +1,8 @@
-### WebDataset==0.2.5
+### Adapting to WebDataset==0.2.5
 
-To adapt the original script to this version of the [WebDataset API](https://github.com/webdataset/webdataset), we make changes to the `make_train_loader` and `make_val_loader` functions:
+[WebDataset API](https://github.com/webdataset/webdataset) 
+
+### Adapt `make_train_loader` and `make_val_loader` functions:
 
 ```
 def make_train_loader(cifar_img_dim, shuffle=10000,batch_size=FLAGS.batch_size):
@@ -38,7 +40,7 @@ def make_train_loader(cifar_img_dim, shuffle=10000,batch_size=FLAGS.batch_size):
 * As the Webdataset is a custom `IterableDataset` we explictly add a `__len__` method to the dataset and dataloader using the `with_length` method ([source](https://github.com/webdataset/webdataset/blob/05a1ea1116781ffe3c3bc257061f2f3e51dfeb0b/webdataset/pipeline.py#L96))
 
 
-### Specify WebDataset API version in the TPU-VM metadata startup script
+### Specify WebDataset API version in the TPU-VM metadata startup script:
 ```
 gcloud alpha compute tpus tpu-vm create ${TPU_NAME} --zone ${ZONE} \
     --accelerator-type ${ACCELERATOR_TYPE} --version ${RUNTIME_VERSION} \
