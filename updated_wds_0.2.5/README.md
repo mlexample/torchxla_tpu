@@ -1,8 +1,8 @@
-### Adapting to WebDataset==0.2.5
+### Adapting original script to use WebDataset==0.2.5
 
 [WebDataset API](https://github.com/webdataset/webdataset) 
 
-### Adapt `make_train_loader` and `make_val_loader` functions:
+### Changes to `make_train_loader` and `make_val_loader` functions:
 
 ```
 def make_train_loader(cifar_img_dim, shuffle=10000,batch_size=FLAGS.batch_size):
