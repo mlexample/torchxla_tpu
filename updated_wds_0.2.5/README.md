@@ -36,3 +36,20 @@ def make_train_loader(cifar_img_dim, shuffle=10000,batch_size=FLAGS.batch_size):
 
 * `with_epoch` sets the epoch length explicitly 
 * As the Webdataset is a custom `IterableDataset` we explictly add a `__len__` method to the dataset and dataloader using the `with_length` method ([source](https://github.com/webdataset/webdataset/blob/05a1ea1116781ffe3c3bc257061f2f3e51dfeb0b/webdataset/pipeline.py#L96))
+
+
+### Specify WebDataset API version in the TPU-VM metadata startup script
+```
+gcloud alpha compute tpus tpu-vm create ${TPU_NAME} --zone ${ZONE} \
+    --accelerator-type ${ACCELERATOR_TYPE} --version ${RUNTIME_VERSION} \
+    --metadata startup-script='#! /bin/bash
+pip install webdataset==0.2.5
+pip install google-cloud-storage
+pip install tensorboardX
+cd /usr/share/
+git clone --recursive https://github.com/pytorch/pytorch
+cd pytorch/
+git clone --recursive https://github.com/pytorch/xla.git
+git clone --recursive https://github.com/mlexample/torchxla_tpu.git
+EOF'
+```
