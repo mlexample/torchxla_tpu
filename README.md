@@ -45,7 +45,6 @@ while true ; do gcloud compute firewall-rules create default-allow-ssh --allow t
 
 Set the following environment variables
 ```
-export REGION=europe-west4
 export ZONE=europe-west4-a
 export ACCELERATOR_TYPE=v3-32 # or v2-32
 export TPU_NAME=my-1vm-tpu
